@@ -1,0 +1,1622 @@
+#!/usr/bin/env python3
+"""
+ISODROP - Real-time Local Wi-Fi Data Sharing System
+Backend: Flask + Flask-SocketIO
+"""
+
+import os
+import socket
+import uuid
+import threading
+import time
+import mimetypes
+import hashlib
+from datetime import datetime, timedelta
+from collections import defaultdict
+from functools import wraps
+import json
+import qrcode
+import io
+import base64
+from flask import Flask, render_template_string, request, send_file
+from flask_socketio import SocketIO, emit, join_room, leave_room, rooms
+from flask_cors import CORS
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'isodrop-secret-key-' + str(uuid.uuid4())
+app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024 * 1024  # 5GB max
+CORS(app)
+socketio = SocketIO(app, cors_allowed_origins="*", ping_timeout=60, ping_interval=25)
+
+# Constants
+UPLOAD_FOLDER = '/tmp/isodrop' if os.name != 'nt' else os.path.join(os.path.expanduser('~'), 'isodrop_temp')
+CHUNK_SIZE = 1024 * 1024  # 1MB chunks
+FILE_EXPIRY_HOURS = 24
+ALLOWED_MIME_TYPES = {
+    'text/plain', 'text/html', 'text/css', 'text/javascript',
+    'application/pdf', 'application/json', 'application/zip',
+    'image/jpeg', 'image/png', 'image/gif', 'image/webp',
+    'audio/mpeg', 'audio/wav', 'audio/ogg',
+    'video/mp4', 'video/mpeg', 'video/quicktime', 'video/x-msvideo',
+    'video/x-matroska'  # MKV
+}
+RATE_LIMIT_REQUESTS = 100
+RATE_LIMIT_WINDOW = 60  # seconds
+MAX_PIN_ATTEMPTS = 5
+
+# Create temp upload folder
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# ============================================================================
+# Data Structures
+# ============================================================================
+
+class Device:
+    def __init__(self, session_id, name=None):
+        self.id = str(uuid.uuid4())[:8]
+        self.session_id = session_id
+        self.name = name or f"Device {self.id}"
+        self.joined_at = datetime.now()
+        self.last_active = datetime.now()
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'name': self.name,
+            'joined_at': self.joined_at.isoformat(),
+            'is_online': True
+        }
+
+class FileTransfer:
+    def __init__(self, file_id, filename, file_size, sender_id, mime_type):
+        self.file_id = file_id
+        self.filename = filename
+        self.file_size = file_size
+        self.sender_id = sender_id
+        self.mime_type = mime_type
+        self.chunks = {}
+        self.created_at = datetime.now()
+        self.file_path = os.path.join(UPLOAD_FOLDER, file_id)
+        self.completed = False
+
+    def to_dict(self):
+        return {
+            'file_id': self.file_id,
+            'filename': self.filename,
+            'file_size': self.file_size,
+            'sender_id': self.sender_id,
+            'mime_type': self.mime_type,
+            'created_at': self.created_at.isoformat()
+        }
+
+# Global state
+devices = {}  # session_id -> Device
+file_transfers = {}  # file_id -> FileTransfer
+rate_limiters = defaultdict(list)  # session_id -> [timestamps]
+pin_attempts = defaultdict(list)  # session_id -> [timestamps]
+room_pins = {}  # room_id -> PIN
+active_sessions = set()
+
+# ============================================================================
+# Utility Functions
+# ============================================================================
+
+def get_local_ip():
+    """Detect local IP address"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+def generate_qr_code(url):
+    """Generate QR code image as base64"""
+    qr = qrcode.QRCode(version=1, box_size=10, border=5)
+    qr.add_data(url)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    
+    buffer = io.BytesIO()
+    img.save(buffer, format='PNG')
+    buffer.seek(0)
+    img_base64 = base64.b64encode(buffer.getvalue()).decode()
+    return f"data:image/png;base64,{img_base64}"
+
+def rate_limit(max_requests=RATE_LIMIT_REQUESTS, window=RATE_LIMIT_WINDOW):
+    """Rate limiting decorator"""
+    def decorator(f):
+        @wraps(f)
+        def wrapped(*args, **kwargs):
+            session_id = request.sid
+            now = time.time()
+            
+            # Clean old requests
+            rate_limiters[session_id] = [t for t in rate_limiters[session_id] 
+                                         if now - t < window]
+            
+            if len(rate_limiters[session_id]) >= max_requests:
+                emit('error', {'message': 'Rate limit exceeded. Please slow down.'})
+                return
+            
+            rate_limiters[session_id].append(now)
+            return f(*args, **kwargs)
+        return wrapped
+    return decorator
+
+def cleanup_expired_files():
+    """Periodically clean up expired temporary files"""
+    while True:
+        time.sleep(3600)  # Every hour
+        now = datetime.now()
+        expired = [fid for fid, transfer in file_transfers.items()
+                   if now - transfer.created_at > timedelta(hours=FILE_EXPIRY_HOURS)]
+        
+        for fid in expired:
+            transfer = file_transfers.pop(fid, None)
+            if transfer and os.path.exists(transfer.file_path):
+                try:
+                    os.remove(transfer.file_path)
+                except Exception:
+                    pass
+
+def validate_mime_type(mime_type):
+    """Validate MIME type"""
+    if not mime_type:
+        return False
+    main_type = mime_type.split('/')[0]
+    return mime_type in ALLOWED_MIME_TYPES or main_type in ['image', 'audio', 'video', 'text', 'application']
+
+# ============================================================================
+# Routes
+# ============================================================================
+
+@app.route('/')
+def index():
+    """Serve frontend"""
+    return render_template_string(FRONTEND_HTML)
+
+@app.route('/download/<file_id>')
+def download_file(file_id):
+    """Download a file"""
+    if file_id not in file_transfers:
+        return "File not found", 404
+    
+    transfer = file_transfers[file_id]
+    if not os.path.exists(transfer.file_path):
+        return "File not found", 404
+    
+    return send_file(transfer.file_path, 
+                     as_attachment=True,
+                     download_name=transfer.filename)
+
+@app.route('/api/server-info')
+def server_info():
+    """Get server connection info"""
+    local_ip = get_local_ip()
+    port = request.host.split(':')[1] if ':' in request.host else '5000'
+    url = f"http://{local_ip}:{port}"
+    qr_code = generate_qr_code(url)
+    
+    return {
+        'server_url': url,
+        'local_ip': local_ip,
+        'qr_code': qr_code,
+        'port': port
+    }
+
+# ============================================================================
+# Socket.IO Events
+# ============================================================================
+
+@socketio.on('connect')
+def on_connect():
+    """Handle client connection"""
+    session_id = request.sid
+    device_name = request.args.get('name', f"Device {str(uuid.uuid4())[:8]}")
+    
+    device = Device(session_id, device_name)
+    devices[session_id] = device
+    active_sessions.add(session_id)
+    
+    print(f"✓ Device connected: {device.name} ({device.id})")
+    
+    # Notify all connected devices
+    socketio.emit('device_connected', {
+        'devices': [d.to_dict() for d in devices.values()],
+        'total': len(devices)
+    })
+
+@socketio.on('disconnect')
+def on_disconnect():
+    """Handle client disconnection"""
+    session_id = request.sid
+    if session_id in devices:
+        device = devices.pop(session_id)
+        active_sessions.discard(session_id)
+        print(f"✗ Device disconnected: {device.name}")
+        
+        # Notify remaining devices
+        socketio.emit('device_disconnected', {
+            'devices': [d.to_dict() for d in devices.values()],
+            'total': len(devices),
+            'disconnected_device': device.name
+        })
+
+@socketio.on('message')
+@rate_limit()
+def on_message(data):
+    """Handle text message"""
+    session_id = request.sid
+    if session_id not in devices:
+        return
+    
+    sender = devices[session_id]
+    message_data = {
+        'id': str(uuid.uuid4()),
+        'sender_id': sender.id,
+        'sender_name': sender.name,
+        'text': data.get('text', '').strip()[:5000],  # Max 5000 chars
+        'timestamp': datetime.now().isoformat(),
+        'type': 'text'
+    }
+    
+    if not message_data['text']:
+        emit('error', {'message': 'Empty message'})
+        return
+    
+    print(f"📨 Message from {sender.name}: {message_data['text'][:50]}")
+    socketio.emit('new_message', message_data)
+
+@socketio.on('file_upload_start')
+@rate_limit(max_requests=50)
+def on_file_upload_start(data):
+    """Initiate file upload"""
+    session_id = request.sid
+    if session_id not in devices:
+        emit('error', {'message': 'Not connected'})
+        return
+    
+    sender = devices[session_id]
+    filename = data.get('filename', 'unknown').strip()
+    file_size = data.get('file_size', 0)
+    mime_type = data.get('mime_type', 'application/octet-stream')
+    
+    # Validation
+    if file_size > app.config['MAX_CONTENT_LENGTH']:
+        emit('error', {'message': f'File too large (max {app.config["MAX_CONTENT_LENGTH"] / (1024**3):.1f}GB)'})
+        return
+    
+    if not validate_mime_type(mime_type):
+        emit('error', {'message': 'File type not allowed'})
+        return
+    
+    if not filename or len(filename) > 255:
+        emit('error', {'message': 'Invalid filename'})
+        return
+    
+    # Create transfer
+    file_id = str(uuid.uuid4())
+    transfer = FileTransfer(file_id, filename, file_size, sender.id, mime_type)
+    file_transfers[file_id] = transfer
+    
+    print(f"📤 Upload started: {filename} ({file_size / (1024**2):.1f}MB) from {sender.name}")
+    
+    emit('file_upload_ready', {
+        'file_id': file_id,
+        'chunk_size': CHUNK_SIZE
+    })
+
+@socketio.on('file_chunk')
+@rate_limit(max_requests=200)
+def on_file_chunk(data):
+    """Receive file chunk"""
+    session_id = request.sid
+    file_id = data.get('file_id')
+    chunk_index = data.get('chunk_index', 0)
+    chunk_data = data.get('chunk')
+    
+    if file_id not in file_transfers:
+        emit('error', {'message': 'Transfer not found'})
+        return
+    
+    transfer = file_transfers[file_id]
+    transfer.chunks[chunk_index] = chunk_data
+    
+    # Calculate progress
+    total_chunks = (transfer.file_size + CHUNK_SIZE - 1) // CHUNK_SIZE
+    received_chunks = len(transfer.chunks)
+    progress = (received_chunks / total_chunks * 100) if total_chunks > 0 else 0
+    
+    # Write to disk if we have all chunks
+    if received_chunks == total_chunks:
+        try:
+            with open(transfer.file_path, 'wb') as f:
+                for i in range(total_chunks):
+                    if i in transfer.chunks:
+                        f.write(base64.b64decode(transfer.chunks[i]))
+            transfer.completed = True
+            print(f"✓ Upload completed: {transfer.filename}")
+        except Exception as e:
+            print(f"✗ Write error: {e}")
+            emit('error', {'message': 'Write failed'})
+            return
+    
+    # Broadcast progress
+    socketio.emit('file_upload_progress', {
+        'file_id': file_id,
+        'progress': progress,
+        'chunk_index': chunk_index,
+        'total_chunks': total_chunks
+    })
+
+@socketio.on('file_upload_complete')
+def on_file_upload_complete(data):
+    """File upload complete, broadcast to all devices"""
+    session_id = request.sid
+    if session_id not in devices:
+        return
+    
+    file_id = data.get('file_id')
+    if file_id not in file_transfers:
+        return
+    
+    transfer = file_transfers[file_id]
+    sender = devices[session_id]
+    
+    file_info = {
+        'file_id': file_id,
+        'filename': transfer.filename,
+        'file_size': transfer.file_size,
+        'mime_type': transfer.mime_type,
+        'sender_id': sender.id,
+        'sender_name': sender.name,
+        'timestamp': datetime.now().isoformat(),
+        'type': 'file'
+    }
+    
+    print(f"📁 File shared: {transfer.filename} by {sender.name}")
+    socketio.emit('new_file', file_info)
+
+@socketio.on('get_devices')
+def on_get_devices():
+    """Get current device list"""
+    devices_list = [d.to_dict() for d in devices.values()]
+    emit('devices_list', {
+        'devices': devices_list,
+        'total': len(devices_list)
+    })
+
+@socketio.on('set_device_name')
+def on_set_device_name(data):
+    """Update device name"""
+    session_id = request.sid
+    if session_id not in devices:
+        return
+    
+    new_name = data.get('name', '').strip()
+    if not new_name or len(new_name) > 50:
+        emit('error', {'message': 'Invalid name'})
+        return
+    
+    devices[session_id].name = new_name
+    socketio.emit('device_updated', {
+        'devices': [d.to_dict() for d in devices.values()],
+        'total': len(devices)
+    })
+
+@socketio.on('ping')
+def on_ping():
+    """Heartbeat ping"""
+    emit('pong')
+
+# ============================================================================
+# Frontend HTML
+# ============================================================================
+
+FRONTEND_HTML = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ISODROP - Real-time Local Data Sharing</title>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --primary: #00d9ff;
+            --secondary: #ff006e;
+            --accent: #8338ec;
+            --dark-bg: #0a0e27;
+            --card-bg: rgba(15, 20, 45, 0.7);
+            --border-color: rgba(0, 217, 255, 0.3);
+            --text-primary: #ffffff;
+            --text-secondary: #b0b7c0;
+            --success: #06ffa5;
+            --error: #ff006e;
+        }
+
+        html, body {
+            height: 100%;
+            width: 100%;
+            overflow: hidden;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+            background: linear-gradient(135deg, #0a0e27 0%, #1a1f4b 50%, #0f1425 100%);
+            color: var(--text-primary);
+            overflow: hidden;
+            position: relative;
+        }
+
+        body::before {
+            content: '';
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: 
+                radial-gradient(circle at 20% 50%, rgba(0, 217, 255, 0.05) 0%, transparent 50%),
+                radial-gradient(circle at 80% 80%, rgba(131, 56, 236, 0.05) 0%, transparent 50%);
+            pointer-events: none;
+            z-index: -1;
+        }
+
+        .container {
+            display: flex;
+            height: 100vh;
+            gap: 1rem;
+            padding: 1rem;
+        }
+
+        .sidebar {
+            width: 320px;
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+            overflow-y: auto;
+            scrollbar-width: thin;
+            scrollbar-color: var(--primary) transparent;
+        }
+
+        .sidebar::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        .sidebar::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        .sidebar::-webkit-scrollbar-thumb {
+            background: var(--primary);
+            border-radius: 3px;
+        }
+
+        .main {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+            overflow: hidden;
+        }
+
+        .card {
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 1.5rem;
+            backdrop-filter: blur(20px);
+            transition: all 0.3s ease;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+        }
+
+        .card:hover {
+            border-color: var(--primary);
+            box-shadow: 0 12px 48px rgba(0, 217, 255, 0.15);
+            transform: translateY(-2px);
+        }
+
+        /* Header */
+        .header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 1rem;
+        }
+
+        .header-title {
+            font-size: 28px;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            letter-spacing: -0.5px;
+        }
+
+        .device-counter {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            background: linear-gradient(135deg, rgba(0, 217, 255, 0.1), rgba(131, 56, 236, 0.1));
+            padding: 0.75rem 1.25rem;
+            border-radius: 12px;
+            border: 1px solid var(--border-color);
+            min-width: 180px;
+            justify-content: center;
+        }
+
+        .pulse-dot {
+            width: 10px;
+            height: 10px;
+            background: var(--primary);
+            border-radius: 50%;
+            animation: pulse 2s ease-in-out infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.5; transform: scale(1.2); }
+        }
+
+        .counter-number {
+            font-size: 24px;
+            font-weight: 700;
+            color: var(--primary);
+        }
+
+        .counter-label {
+            font-size: 12px;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        /* QR Section */
+        .qr-section {
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+            align-items: center;
+        }
+
+        .qr-container {
+            width: 200px;
+            height: 200px;
+            background: white;
+            border-radius: 12px;
+            padding: 1rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .qr-container img {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+
+        .qr-label {
+            font-size: 12px;
+            color: var(--text-secondary);
+            text-align: center;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .server-url {
+            font-size: 11px;
+            padding: 0.75rem;
+            background: rgba(0, 217, 255, 0.1);
+            border: 1px solid var(--primary);
+            border-radius: 8px;
+            text-align: center;
+            font-family: 'Courier New', monospace;
+            color: var(--primary);
+            word-break: break-all;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .server-url:hover {
+            background: rgba(0, 217, 255, 0.2);
+        }
+
+        /* Devices List */
+        .devices-section {
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+
+        .section-title {
+            font-size: 12px;
+            font-weight: 700;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 0.25rem;
+        }
+
+        .device-item {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            padding: 1rem;
+            background: rgba(0, 217, 255, 0.05);
+            border: 1px solid rgba(0, 217, 255, 0.2);
+            border-radius: 10px;
+            transition: all 0.3s ease;
+            cursor: pointer;
+        }
+
+        .device-item:hover {
+            background: rgba(0, 217, 255, 0.1);
+            border-color: var(--primary);
+            transform: translateX(4px);
+        }
+
+        .device-avatar {
+            width: 40px;
+            height: 40px;
+            background: linear-gradient(135deg, var(--primary), var(--accent));
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            font-size: 14px;
+            box-shadow: 0 4px 12px rgba(0, 217, 255, 0.3);
+        }
+
+        .device-info {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .device-name {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--text-primary);
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .device-status {
+            font-size: 11px;
+            color: var(--text-secondary);
+        }
+
+        /* Upload Zone */
+        .upload-zone {
+            border: 2px dashed var(--primary);
+            border-radius: 12px;
+            padding: 2rem;
+            text-align: center;
+            background: rgba(0, 217, 255, 0.05);
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+            align-items: center;
+        }
+
+        .upload-zone:hover {
+            background: rgba(0, 217, 255, 0.15);
+            border-color: var(--secondary);
+        }
+
+        .upload-zone.dragover {
+            background: rgba(0, 217, 255, 0.25);
+            border-color: var(--primary);
+            transform: scale(1.02);
+        }
+
+        .upload-icon {
+            font-size: 48px;
+            animation: float 3s ease-in-out infinite;
+        }
+
+        @keyframes float {
+            0%, 100% { transform: translateY(0); }
+            50% { transform: translateY(-10px); }
+        }
+
+        .upload-text {
+            font-size: 14px;
+            color: var(--text-secondary);
+        }
+
+        .upload-hint {
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+
+        /* Message/File Display */
+        .messages-container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+            overflow-y: auto;
+            padding: 1rem;
+            scrollbar-width: thin;
+            scrollbar-color: var(--primary) transparent;
+        }
+
+        .messages-container::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        .messages-container::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        .messages-container::-webkit-scrollbar-thumb {
+            background: var(--primary);
+            border-radius: 3px;
+        }
+
+        .message-group {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+            animation: slideIn 0.3s ease;
+        }
+
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .message-sender {
+            font-size: 12px;
+            font-weight: 700;
+            color: var(--primary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-left: 0.5rem;
+        }
+
+        .message-bubble {
+            background: linear-gradient(135deg, rgba(0, 217, 255, 0.1), rgba(131, 56, 236, 0.1));
+            border: 1px solid rgba(0, 217, 255, 0.3);
+            border-radius: 12px;
+            padding: 1rem;
+            max-width: 70%;
+            word-wrap: break-word;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+        }
+
+        .message-text {
+            font-size: 14px;
+            line-height: 1.5;
+            color: var(--text-primary);
+        }
+
+        .message-time {
+            font-size: 11px;
+            color: var(--text-secondary);
+            margin-top: 0.5rem;
+        }
+
+        /* File Card */
+        .file-card {
+            background: linear-gradient(135deg, rgba(131, 56, 236, 0.1), rgba(255, 0, 110, 0.1));
+            border: 1px solid rgba(131, 56, 236, 0.3);
+            border-radius: 12px;
+            padding: 1rem;
+            display: flex;
+            gap: 1rem;
+            max-width: 90%;
+            transition: all 0.3s ease;
+        }
+
+        .file-card:hover {
+            border-color: var(--secondary);
+            transform: translateX(-4px);
+        }
+
+        .file-icon {
+            width: 60px;
+            height: 60px;
+            background: linear-gradient(135deg, var(--secondary), var(--accent));
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 28px;
+            flex-shrink: 0;
+        }
+
+        .file-details {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+
+        .file-name {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--text-primary);
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .file-meta {
+            display: flex;
+            gap: 0.75rem;
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+
+        .file-size {
+            color: var(--primary);
+        }
+
+        .file-sender {
+            color: var(--secondary);
+            font-weight: 600;
+        }
+
+        .progress-bar {
+            height: 3px;
+            background: rgba(0, 217, 255, 0.2);
+            border-radius: 2px;
+            overflow: hidden;
+            margin-top: 0.5rem;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--primary), var(--secondary));
+            transition: width 0.2s ease;
+        }
+
+        .file-actions {
+            display: flex;
+            gap: 0.5rem;
+            margin-top: 0.75rem;
+        }
+
+        .btn-small {
+            padding: 0.5rem 1rem;
+            border: none;
+            border-radius: 6px;
+            background: rgba(0, 217, 255, 0.2);
+            color: var(--primary);
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 600;
+            transition: all 0.2s ease;
+        }
+
+        .btn-small:hover {
+            background: rgba(0, 217, 255, 0.3);
+            transform: scale(1.05);
+        }
+
+        /* Input Area */
+        .input-area {
+            display: flex;
+            gap: 0.75rem;
+            padding: 1rem;
+        }
+
+        .input-group {
+            flex: 1;
+            display: flex;
+            gap: 0.75rem;
+            align-items: center;
+        }
+
+        input[type="text"] {
+            flex: 1;
+            background: rgba(15, 20, 45, 0.9);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            padding: 0.75rem 1rem;
+            color: var(--text-primary);
+            font-size: 14px;
+            transition: all 0.3s ease;
+        }
+
+        input[type="text"]:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 12px rgba(0, 217, 255, 0.3);
+        }
+
+        input[type="file"] {
+            display: none;
+        }
+
+        .btn-primary {
+            padding: 0.75rem 1.5rem;
+            background: linear-gradient(135deg, var(--primary), var(--accent));
+            border: none;
+            border-radius: 10px;
+            color: var(--text-primary);
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-size: 14px;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 20px rgba(0, 217, 255, 0.4);
+        }
+
+        .btn-primary:active {
+            transform: translateY(0);
+        }
+
+        .btn-icon {
+            width: 40px;
+            height: 40px;
+            padding: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: rgba(0, 217, 255, 0.2);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            cursor: pointer;
+            color: var(--primary);
+            transition: all 0.3s ease;
+            font-size: 18px;
+        }
+
+        .btn-icon:hover {
+            background: rgba(0, 217, 255, 0.3);
+            border-color: var(--primary);
+        }
+
+        /* Toast Notifications */
+        .toast {
+            position: fixed;
+            bottom: 2rem;
+            right: 2rem;
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            padding: 1rem 1.5rem;
+            color: var(--text-primary);
+            font-size: 14px;
+            animation: slideUp 0.3s ease;
+            backdrop-filter: blur(20px);
+            z-index: 1000;
+            max-width: 400px;
+        }
+
+        .toast.success {
+            border-color: var(--success);
+            background: rgba(6, 255, 165, 0.1);
+        }
+
+        .toast.error {
+            border-color: var(--error);
+            background: rgba(255, 0, 110, 0.1);
+        }
+
+        @keyframes slideUp {
+            from {
+                opacity: 0;
+                transform: translateY(20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        /* Video Preview */
+        .video-preview {
+            width: 100%;
+            max-width: 600px;
+            border-radius: 10px;
+            background: #000;
+            margin-top: 0.5rem;
+        }
+
+        /* Image Preview */
+        .image-preview {
+            width: 100%;
+            max-width: 400px;
+            border-radius: 10px;
+            object-fit: contain;
+            margin-top: 0.5rem;
+        }
+
+        /* Responsive */
+        @media (max-width: 1024px) {
+            .container {
+                flex-direction: column;
+            }
+
+            .sidebar {
+                width: 100%;
+                height: auto;
+                max-height: 200px;
+                overflow-x: auto;
+                display: flex;
+                flex-direction: row;
+                gap: 0.75rem;
+            }
+
+            .qr-section {
+                display: none;
+            }
+
+            .main {
+                overflow: auto;
+            }
+
+            .message-bubble {
+                max-width: 90%;
+            }
+
+            .file-card {
+                max-width: 100%;
+            }
+        }
+
+        @media (max-width: 768px) {
+            .container {
+                padding: 0.75rem;
+            }
+
+            .card {
+                padding: 1rem;
+            }
+
+            .header-title {
+                font-size: 20px;
+            }
+
+            .upload-zone {
+                padding: 1.5rem;
+            }
+
+            .toast {
+                right: 1rem;
+                left: 1rem;
+                max-width: none;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Sidebar -->
+        <div class="sidebar">
+            <!-- Header -->
+            <div class="card">
+                <div class="header">
+                    <div class="header-title">🚀 ISODROP</div>
+                </div>
+            </div>
+
+            <!-- Device Counter -->
+            <div class="card">
+                <div class="device-counter">
+                    <div class="pulse-dot"></div>
+                    <div style="display: flex; flex-direction: column; align-items: center; gap: 0.25rem;">
+                        <div class="counter-number" id="deviceCount">0</div>
+                        <div class="counter-label">Connected</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- QR Section -->
+            <div class="card qr-section">
+                <div style="font-size: 12px; font-weight: 700; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 1px;">Scan to Join</div>
+                <div class="qr-container">
+                    <img id="qrCode" src="" alt="QR Code">
+                </div>
+                <div class="server-url" id="serverUrl" title="Click to copy">Loading...</div>
+                <div class="qr-label">Devices on same Wi-Fi can scan this</div>
+            </div>
+
+            <!-- Devices List -->
+            <div class="card devices-section">
+                <div class="section-title">👥 Active Devices</div>
+                <div id="devicesList"></div>
+            </div>
+
+            <!-- Upload Zone -->
+            <div class="card upload-zone" id="uploadZone">
+                <div class="upload-icon">📤</div>
+                <div class="upload-text">Drag files here or click</div>
+                <div class="upload-hint">Up to 5GB • Any format</div>
+                <input type="file" id="fileInput" multiple>
+            </div>
+        </div>
+
+        <!-- Main Area -->
+        <div class="main">
+            <!-- Messages Container -->
+            <div class="card" style="flex: 1; overflow: hidden; display: flex; flex-direction: column;">
+                <div style="font-size: 12px; font-weight: 700; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 1rem;">💬 Shared Content</div>
+                <div class="messages-container" id="messagesContainer"></div>
+                <div class="input-area">
+                    <div class="input-group">
+                        <input type="text" id="messageInput" placeholder="Share a message...">
+                        <button class="btn-primary" id="sendBtn">Send</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // ====================================================================
+        // ISODROP Frontend
+        // ====================================================================
+
+        const socket = io();
+        let currentDeviceId = null;
+        let devices = {};
+        let fileTransfers = {};
+        let deviceName = localStorage.getItem('isodrop_device_name') || `Device ${Math.random().toString(36).substr(2, 5).toUpperCase()}`;
+
+        // Initialize
+        window.addEventListener('load', () => {
+            initializeApp();
+        });
+
+        function initializeApp() {
+            setupSocketListeners();
+            loadServerInfo();
+            setupUIListeners();
+            fetchDeviceList();
+            requestNotificationPermission();
+        }
+
+        function loadServerInfo() {
+            fetch('/api/server-info')
+                .then(r => r.json())
+                .then(data => {
+                    document.getElementById('qrCode').src = data.qr_code;
+                    document.getElementById('serverUrl').textContent = data.server_url;
+                })
+                .catch(console.error);
+        }
+
+        // ====================================================================
+        // Socket.IO Setup
+        // ====================================================================
+
+        function setupSocketListeners() {
+            socket.on('connect', () => {
+                console.log('Connected to server');
+                socket.emit('set_device_name', { name: deviceName });
+            });
+
+            socket.on('disconnect', () => {
+                showToast('Disconnected from server', 'error');
+            });
+
+            socket.on('device_connected', (data) => {
+                updateDevicesList(data.devices);
+                updateDeviceCount(data.total);
+                if (data.devices.length > 1) {
+                    showToast('New device joined!', 'success');
+                }
+            });
+
+            socket.on('device_disconnected', (data) => {
+                updateDevicesList(data.devices);
+                updateDeviceCount(data.total);
+                showToast(`${data.disconnected_device} left`, 'error');
+            });
+
+            socket.on('device_updated', (data) => {
+                updateDevicesList(data.devices);
+                updateDeviceCount(data.total);
+            });
+
+            socket.on('devices_list', (data) => {
+                updateDevicesList(data.devices);
+                updateDeviceCount(data.total);
+            });
+
+            socket.on('new_message', (msg) => {
+                displayMessage(msg);
+            });
+
+            socket.on('new_file', (file) => {
+                displayFile(file);
+            });
+
+            socket.on('file_upload_ready', (data) => {
+                uploadFileChunks(data.file_id, data.chunk_size);
+            });
+
+            socket.on('file_upload_progress', (data) => {
+                updateFileProgress(data.file_id, data.progress);
+            });
+
+            socket.on('error', (data) => {
+                showToast(data.message, 'error');
+            });
+
+            socket.on('pong', () => {
+                console.log('Pong received');
+            });
+        }
+
+        // ====================================================================
+        // Device Management
+        // ====================================================================
+
+        function updateDevicesList(deviceList) {
+            devices = {};
+            deviceList.forEach(d => devices[d.id] = d);
+            
+            const container = document.getElementById('devicesList');
+            container.innerHTML = deviceList.map(d => `
+                <div class="device-item">
+                    <div class="device-avatar">${d.name.charAt(0).toUpperCase()}</div>
+                    <div class="device-info">
+                        <div class="device-name">${d.name}</div>
+                        <div class="device-status">🟢 Online</div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function updateDeviceCount(count) {
+            document.getElementById('deviceCount').textContent = count;
+        }
+
+        function fetchDeviceList() {
+            socket.emit('get_devices');
+        }
+
+        // ====================================================================
+        // Message Handling
+        // ====================================================================
+
+        function displayMessage(msg) {
+            const container = document.getElementById('messagesContainer');
+            const time = new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            
+            const html = `
+                <div class="message-group">
+                    <div class="message-sender">${msg.sender_name}</div>
+                    <div class="message-bubble">
+                        <div class="message-text">${escapeHtml(msg.text)}</div>
+                        <div class="message-time">${time}</div>
+                    </div>
+                </div>
+            `;
+            
+            container.insertAdjacentHTML('beforeend', html);
+            container.scrollTop = container.scrollHeight;
+            showNotification(`${msg.sender_name}`, msg.text);
+        }
+
+        function sendMessage() {
+            const input = document.getElementById('messageInput');
+            const text = input.value.trim();
+            if (!text) return;
+            
+            socket.emit('message', { text });
+            input.value = '';
+        }
+
+        // ====================================================================
+        // File Upload
+        // ====================================================================
+
+        function setupUIListeners() {
+            // Message sending
+            document.getElementById('sendBtn').addEventListener('click', sendMessage);
+            document.getElementById('messageInput').addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') sendMessage();
+            });
+
+            // File upload
+            const uploadZone = document.getElementById('uploadZone');
+            const fileInput = document.getElementById('fileInput');
+
+            uploadZone.addEventListener('click', () => fileInput.click());
+
+            uploadZone.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                uploadZone.classList.add('dragover');
+            });
+
+            uploadZone.addEventListener('dragleave', () => {
+                uploadZone.classList.remove('dragover');
+            });
+
+            uploadZone.addEventListener('drop', (e) => {
+                e.preventDefault();
+                uploadZone.classList.remove('dragover');
+                handleFileSelect(e.dataTransfer.files);
+            });
+
+            fileInput.addEventListener('change', (e) => {
+                handleFileSelect(e.target.files);
+            });
+
+            // Heartbeat
+            setInterval(() => {
+                socket.emit('ping');
+            }, 30000);
+
+            // Copy server URL
+            document.getElementById('serverUrl').addEventListener('click', function() {
+                navigator.clipboard.writeText(this.textContent);
+                showToast('URL copied!', 'success');
+            });
+        }
+
+        function handleFileSelect(files) {
+            Array.from(files).forEach(file => {
+                if (file.size > 5 * 1024 * 1024 * 1024) {
+                    showToast('File too large (max 5GB)', 'error');
+                    return;
+                }
+                
+                uploadFile(file);
+            });
+
+            // Reset input
+            document.getElementById('fileInput').value = '';
+        }
+
+        function uploadFile(file) {
+            const fileId = generateId();
+            
+            socket.emit('file_upload_start', {
+                filename: file.name,
+                file_size: file.size,
+                mime_type: file.type || 'application/octet-stream'
+            });
+
+            fileTransfers[fileId] = {
+                file: file,
+                uploaded: 0,
+                total: file.size
+            };
+        }
+
+        function uploadFileChunks(fileId, chunkSize) {
+            const transfer = fileTransfers[fileId];
+            if (!transfer) return;
+
+            const file = transfer.file;
+            let chunkIndex = 0;
+            const totalChunks = Math.ceil(file.size / chunkSize);
+
+            const uploadChunk = () => {
+                if (chunkIndex >= totalChunks) {
+                    socket.emit('file_upload_complete', { file_id: fileId });
+                    showToast(`${file.name} shared!`, 'success');
+                    return;
+                }
+
+                const start = chunkIndex * chunkSize;
+                const end = Math.min(start + chunkSize, file.size);
+                const chunk = file.slice(start, end);
+
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    const chunkData = e.target.result.split(',')[1];
+                    socket.emit('file_chunk', {
+                        file_id: fileId,
+                        chunk_index: chunkIndex,
+                        chunk: chunkData
+                    });
+                    chunkIndex++;
+                    setTimeout(uploadChunk, 50);
+                };
+                reader.readAsDataURL(chunk);
+            };
+
+            uploadChunk();
+        }
+
+        function updateFileProgress(fileId, progress) {
+            const bar = document.querySelector(`[data-file="${fileId}"] .progress-fill`);
+            if (bar) {
+                bar.style.width = `${progress}%`;
+            }
+        }
+
+        // ====================================================================
+        // File Display
+        // ====================================================================
+
+        function displayFile(file) {
+            const container = document.getElementById('messagesContainer');
+            const sender = devices[file.sender_id] || { name: 'Unknown' };
+            const fileSize = formatBytes(file.file_size);
+            const time = new Date(file.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            
+            const fileIcon = getFileIcon(file.mime_type);
+            const preview = getFilePreview(file);
+
+            const html = `
+                <div class="message-group">
+                    <div class="message-sender">${sender.name}</div>
+                    <div class="file-card" data-file="${file.file_id}">
+                        <div class="file-icon">${fileIcon}</div>
+                        <div class="file-details">
+                            <div class="file-name">${escapeHtml(file.filename)}</div>
+                            <div class="file-meta">
+                                <span class="file-size">${fileSize}</span>
+                                <span class="file-sender">${sender.name}</span>
+                                <span>${time}</span>
+                            </div>
+                            <div class="progress-bar">
+                                <div class="progress-fill" style="width: 100%;"></div>
+                            </div>
+                            <div class="file-actions">
+                                <a href="/download/${file.file_id}" download="${file.filename}" class="btn-small">⬇️ Download</a>
+                                ${preview}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+            
+            container.insertAdjacentHTML('beforeend', html);
+            container.scrollTop = container.scrollHeight;
+            showNotification(`${sender.name}`, `📁 Shared: ${file.filename}`);
+        }
+
+        function getFileIcon(mime) {
+            if (mime.startsWith('image/')) return '🖼️';
+            if (mime.startsWith('video/')) return '🎬';
+            if (mime.startsWith('audio/')) return '🎵';
+            if (mime.includes('pdf')) return '📄';
+            if (mime.includes('zip')) return '📦';
+            if (mime.includes('text')) return '📝';
+            return '📁';
+        }
+
+        function getFilePreview(file) {
+            if (file.mime_type.startsWith('image/')) {
+                return `<button class="btn-small" onclick="previewImage('/download/${file.file_id}')">👁️ Preview</button>`;
+            }
+            if (file.mime_type.startsWith('video/')) {
+                return `<button class="btn-small" onclick="playVideo('/download/${file.file_id}')">▶️ Play</button>`;
+            }
+            return '';
+        }
+
+        window.previewImage = function(url) {
+            const modal = document.createElement('div');
+            modal.style.cssText = `
+                position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+                background: rgba(0,0,0,0.9); display: flex; align-items: center;
+                justify-content: center; z-index: 9999; cursor: pointer;
+            `;
+            modal.innerHTML = `<img src="${url}" style="max-width: 90%; max-height: 90%; border-radius: 10px;">`;
+            modal.addEventListener('click', () => modal.remove());
+            document.body.appendChild(modal);
+        };
+
+        window.playVideo = function(url) {
+            const modal = document.createElement('div');
+            modal.style.cssText = `
+                position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+                background: rgba(0,0,0,0.9); display: flex; align-items: center;
+                justify-content: center; z-index: 9999;
+            `;
+            modal.innerHTML = `
+                <div style="position: relative; width: 90%; max-width: 1000px;">
+                    <video class="video-preview" controls autoplay>
+                        <source src="${url}">
+                    </video>
+                    <button onclick="this.closest('div').parentElement.remove()" style="
+                        position: absolute; top: 10px; right: 10px; background: rgba(0,0,0,0.7);
+                        color: white; border: none; padding: 10px 15px; border-radius: 5px;
+                        cursor: pointer; font-size: 16px;
+                    ">✕</button>
+                </div>
+            `;
+            document.body.appendChild(modal);
+        };
+
+        // ====================================================================
+        // Utilities
+        // ====================================================================
+
+        function showToast(message, type = 'info') {
+            const toast = document.createElement('div');
+            toast.className = `toast ${type}`;
+            toast.textContent = message;
+            document.body.appendChild(toast);
+            
+            setTimeout(() => {
+                toast.style.animation = 'slideUp 0.3s ease reverse';
+                setTimeout(() => toast.remove(), 300);
+            }, 3000);
+        }
+
+        function showNotification(title, body) {
+            if ('Notification' in window && Notification.permission === 'granted') {
+                new Notification(title, { body, icon: '🚀' });
+            }
+        }
+
+        function requestNotificationPermission() {
+            if ('Notification' in window && Notification.permission === 'default') {
+                Notification.requestPermission();
+            }
+        }
+
+        function formatBytes(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function generateId() {
+            return Math.random().toString(36).substr(2, 9);
+        }
+    </script>
+</body>
+</html>
+'''
+
+# ============================================================================
+# Main
+# ============================================================================
+
+if __name__ == '__main__':
+    # Start cleanup thread
+    cleanup_thread = threading.Thread(target=cleanup_expired_files, daemon=True)
+    cleanup_thread.start()
+    
+    local_ip = get_local_ip()
+    print("\n" + "="*70)
+    print("🚀 ISODROP - Real-time Local Data Sharing System")
+    print("="*70)
+    print(f"✓ Server running on: http://{local_ip}:5000")
+    print(f"✓ Open this URL in your browser to access ISODROP")
+    print(f"✓ Devices on the same Wi-Fi can join via QR code or direct URL")
+    print("="*70 + "\n")
+    
+    socketio.run(app, host='0.0.0.0', port=5000, debug=False, allow_unsafe_werkzeug=True)
